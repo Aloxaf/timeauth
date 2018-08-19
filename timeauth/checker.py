@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
+from __future__ import print_function
 
-import time
+from abc import ABCMeta, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Manager
+
 from pwn import log
 from .config import (DEFAULT_CHARSET,
                      DEFAULT_TOKEN_LENGTH,
-                     DEFAULT_HIDDEN_CHAR
+                     DEFAULT_HIDDEN_CHAR,
+                     DEFAULT_MAX_THREAD,
+                     DEFAULT_CHECK_MANUALLY
                      )
 
 
 class TimeAuthChecker(object):
+    __metaclass__ = ABCMeta
 
     """ Class used to bypass a time based authentication """
 
@@ -17,7 +24,9 @@ class TimeAuthChecker(object):
                  token_length=DEFAULT_TOKEN_LENGTH,
                  base_token="",
                  hidden_char=DEFAULT_HIDDEN_CHAR,
-                 break_on_time=0):
+                 break_on_time=0,
+                 max_thread=DEFAULT_MAX_THREAD,
+                 check_manually=DEFAULT_CHECK_MANUALLY):
 
         """ Checker constructor
 
@@ -28,12 +37,16 @@ class TimeAuthChecker(object):
         :hidden_char: The character you want to use for the displayed hidden char
         :break_on_time: If you want to stop searching for other offset character when you find a character that took
                         more than break_on_time time unit (in second, can be a float)
+        :max_thread: The max count of the threads
+        :check_manually: Sometimes you may have to check the result manually, especially when network is horrible
         """
         self._charset = charset
         self._token_length = token_length
         self._hidden_char = hidden_char
         self._break_on_time = break_on_time
-        self._token = [c for c in base_token] + [self._hidden_char for _ in range(self._token_length - len(base_token))]
+        self._token = base_token
+        self._max_thread=max_thread
+        self._check_manually=check_manually
 
     @classmethod
     def _avg(cls, l):
@@ -45,87 +58,67 @@ class TimeAuthChecker(object):
 
         return sum(l) / float(len(l))
 
-    def request(self):
-
-        """ Do a request on a server to check the validity of a new token """
-
-        raise NotImplementedError('You should implement this one')
+    @abstractmethod
+    def request(self, token):
+        """
+        send the token to server and wait for it return
+        :param token: token to send
+        :return: time_cost
+        """
+        pass
 
     def get_token(self):
 
         """ Retrieve the string token stored in the object """
 
-        return ''.join(self._token)
+        return self._token
 
-    def _get_token_offsets(self):
-
-        """ Retrieve the token extremities from the length and the hidden char
-
-            exemple: whith self._token = "abc__" : _get_token_offsets() => [0, 2]
-        """
-
-        return range(len(''.join(self._token).rstrip(self._hidden_char)), self._token_length)
-
-    def _get_timing(self):
-
-        """ Get a time based unit """
-
-        return time.time()
-
-    def _log(self, progress, offset, char, t1, t2, timings, i, best_candidate):
-
-        """ progress loading with average and other informations """
-
-        progress.status("""
-                        Testing %d/%d '%c' \\x%x
-                        Current Flag: [%s]
-                        Took: %s
-                        Max: %s:%c
-                        Avg: %s
-                        """ % (
-                            i,
-                            self._token_length,
-                            char,
-                            ord(char),
-                            ''.join(self._token),
-                            (t2 - t1),
-                            max(timings),
-                            best_candidate,
-                            self._avg(timings)
-                        ))
-
+    # TODO: break on time
     def process(self):
 
         """ Iterate on token_length and find more intresting char """
+        log.info('Start guessing token ..')
+        self._progress = log.progress('Auth ..')
+        self._m = Manager()
+        self._lock = self._m.Lock()
 
-        log.info("Start guessing token ..")
-        progress = log.progress('Auth ..')
-        for offset in self._get_token_offsets():
-            timings = []
-            for i, char in enumerate(self._charset):
-                self._token[offset] = char
-                t1 = self._get_timing()
-                self.request()
-                t2 = self._get_timing()
-                timings.append(t2 - t1)
-                best_candidate = self._charset[timings.index(max(timings))]
-                self._log(progress, offset, char, t1, t2, timings, i, best_candidate)
-                if self._break_on_time != 0:
-                    if (max(timings) > min(timings) + self._break_on_time):
-                        break
-            found_char = self._charset[timings.index(max(timings))]
-            self._token[offset] = found_char
-            log.success("Found Char: %d:%x:%c - Best: %s - Avg: %s" % (
-                ord(found_char),
-                ord(found_char),
-                found_char,
-                max(timings),
-                self._avg(timings)
-            ))
-        progress.success("DONE! %s" % (self.get_token()))
+        offset = 0
+        while offset < self._token_length:
+            cost_time = {}
+
+            with ThreadPoolExecutor(max_workers=self._max_thread) as executor:
+                tokens = ['{}{}'.format(self._token, c) for c in self._charset]
+                tasks = zip(self._charset, executor.map(self.request_wrap, tokens))
+
+                for c, t in tasks:
+                    cost_time[c] = t
+                    best_candidate = max(cost_time, key=cost_time.__getitem__)
+
+            found_char = best_candidate
+            log.success('Finally Flag: {{:{}<{}}}'
+                        .format(self._hidden_char, self._token_length)
+                        .format(self._token + found_char))
+
+            if self._check_manually:
+                log.info('Try again? (Y/N) ')
+                if raw_input().upper().strip() == 'Y':
+                    continue
+            offset += 1
+            self._token += found_char
+
+        self._progress.success("DONE! {}".format(self._token))
+
+    def request_wrap(self, token):
+        ret = self.request(token)
+        with self._lock:
+            print('Current Flag: {{:{}<{}}} {}'
+                  .format(self._hidden_char, self._token_length, ret)
+                  .format(token))
+
+        return ret
 
     def print_token(self):
 
         """ Display the found token """
 
-        log.success("Your token : [%s]" % self.get_token())
+        log.success("Your token : [{}]".format(self.get_token()))

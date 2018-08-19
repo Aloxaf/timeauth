@@ -55,6 +55,7 @@ This package has been made to make exploitation of this kind of service faster b
 exemple:
 
 ```py
+from time import time
 from pwn import remote, context
 from timeauth import TimeAuthChecker
 
@@ -69,14 +70,15 @@ class ExampleChecker(TimeAuthChecker):
         )
 
     def request(self):
-
         context.log_level = 'error'
         s = remote('localhost', 1337)
+        base_time = time()
         s.recvuntil(':')
         s.sendline(self.get_token())
         s.readall()
         s.close()
         context.log_level = 'info'
+        return time() - base_time
 
 if __name__ == "__main__":
     a = ExampleChecker()
@@ -87,4 +89,5 @@ if __name__ == "__main__":
 
 * Add a Time Based SQL Injection Module
 * Add a Blind SQL Injection Module
+* Python3 Support
 
